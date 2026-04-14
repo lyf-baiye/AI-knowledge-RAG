@@ -1,4 +1,4 @@
-# Knowledge Manager - AI工程辅助中心
+# AI-Knowledge-RAG - AI工程辅助中心
 
 ## 🎯 项目简介
 
