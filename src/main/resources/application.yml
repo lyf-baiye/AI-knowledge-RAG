@@ -1,0 +1,127 @@
+spring:
+  application:
+    name: knowledge-manager-monolithic
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:knowledge_manager}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
+      idle-timeout: 30000
+      pool-name: KnowledgeManagerHikariCP
+      max-lifetime: 1800000
+      connection-timeout: 30000
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    database: 0
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: /
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
+# MyBatis-Plus配置
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.knowledgemanager.common.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# LangChain4j配置
+langchain4j:
+  embedding:
+    # 使用阿里云text-embedding-v3模型
+    model: text-embedding-v3
+    dimension: 1024
+  chunk:
+    default-size: 500
+    default-overlap: 50
+  # 阿里云DashScope配置（text-embedding-v3）
+  dashscope:
+    api-key: ${DASHSCOPE_API_KEY:your-dashscope-api-key}
+    base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+  # Pinecone配置（向量数据库）
+  pinecone:
+    api-key: ${PINECONE_API_KEY:your-pinecone-api-key}
+    index-name: ${PINECONE_INDEX:knowledge-manager}
+    index-url: ${PINECONE_INDEX_URL:https://your-index-name.svc.us-west1-gcp.pinecone.io}
+
+# LLM配置 - DeepSeek
+llm:
+  deepseek:
+    api-key: ${DEEPSEEK_API_KEY:your-deepseek-api-key}
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/v1}
+    model: ${DEEPSEEK_MODEL:deepseek-chat}
+    temperature: 0.7
+    max-tokens: 2000
+
+# RAG配置
+rag:
+  system-prompt: "你是一个专业的设计团队知识库助手。请基于以下检索到的设计知识内容来回答用户的问题。如果无法从提供的内容中找到答案，请说明你不知道，并建议用户查阅相关文档。"
+  retrieval-top-k: 5
+  score-threshold: 0.7
+  max-context-length: 4000
+
+# 重排序配置
+rerank:
+  enabled: true
+  top-k: 5
+  method: keyword  # score: 基于分数, keyword: 关键词匹配, llm: 使用LLM重排序
+
+# 记忆系统配置
+memory:
+  short-term:
+    max-messages: 20
+    ttl-hours: 24
+    summary-threshold: 10
+  long-term:
+    importance-threshold: 0.6
+    max-retrieve: 3
+
+# 腾讯云COS配置
+tencent:
+  cos:
+    secret-id: ${TENCENT_COS_SECRET_ID:your-secret-id}
+    secret-key: ${TENCENT_COS_SECRET_KEY:your-secret-key}
+    region: ${TENCENT_COS_REGION:ap-guangzhou}
+    bucket: ${TENCENT_COS_BUCKET:your-bucket-name}
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.knowledgemanager: DEBUG
+  pattern:
+    console: '%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n'
+
+# Actuator配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+# 服务器配置
+server:
+  port: 8080
+  servlet:
+    context-path: /

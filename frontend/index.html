@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>团队智能问答知识库</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f7fa; }
+        .app-container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; }
+        .header h1 { font-size: 32px; margin-bottom: 10px; }
+        .header p { opacity: 0.9; }
+        .main-content { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
+        .sidebar { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+        .chat-container { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+        .message-list { height: 500px; overflow-y: auto; margin-bottom: 20px; padding: 10px; background: #fafafa; border-radius: 8px; }
+        .message { margin-bottom: 15px; padding: 12px; border-radius: 8px; }
+        .message.user { background: #e3f2fd; margin-left: 20%; }
+        .message.assistant { background: #fff3e0; margin-right: 20%; }
+        .message-header { font-size: 12px; color: #666; margin-bottom: 5px; }
+        .message-content { line-height: 1.6; }
+        .input-area { display: flex; gap: 10px; }
+        .input-area textarea { flex: 1; min-height: 60px; }
+        .file-list { margin-top: 20px; }
+        .file-item { padding: 10px; border: 1px solid #eee; border-radius: 5px; margin-bottom: 10px; }
+        .file-item:hover { background: #f5f5f5; }
+        .status-badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+        .status-completed { background: #e8f5e9; color: #2e7d32; }
+        .status-processing { background: #fff3e0; color: #f57c00; }
+        .status-failed { background: #ffebee; color: #c62828; }
+        .knowledge-sources { margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px; font-size: 12px; }
+        .knowledge-sources h4 { margin-bottom: 5px; }
+        .knowledge-sources ul { margin-left: 20px; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div class="app-container">
+        <div class="header">
+            <h1>🎨 AI工程辅助中心</h1>
+            <p>上传设计文档，智能问答，支持上下文记忆</p>
+        </div>
+
+        <div class="main-content">
+            <!-- 左侧：文件上传和知识库 -->
+            <div class="sidebar">
+                <el-tabs v-model="activeTab">
+                    <el-tab-pane label="文件上传" name="upload">
+                        <el-select v-model="selectedUploadKB" placeholder="选择上传的知识库" style="width: 100%; margin-bottom: 15px;" @change="loadFiles">
+                            <el-option v-for="kb in knowledgeBases" :key="kb.id" :label="kb.name" :value="kb.id"></el-option>
+                        </el-select>
+                        
+                        <el-upload
+                            drag
+                            action="/api/files/upload"
+                            :data="uploadData"
+                            :headers="uploadHeaders"
+                            :on-success="handleUploadSuccess"
+                            :on-error="handleUploadError"
+                            multiple>
+                            <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+                            <div class="el-upload__text">
+                                拖拽文件到此处或<em>点击上传</em>
+                            </div>
+                            <template #tip>
+                                <div class="el-upload__tip">
+                                    支持 PDF、Word、Markdown、TXT 格式，最大100MB
+                                </div>
+                            </template>
+                        </el-upload>
+
+                        <div class="file-list" v-if="files.length > 0">
+                            <h3>已上传文件</h3>
+                            <div v-for="file in files" :key="file.id" class="file-item">
+                                <div><strong>{{ file.fileName }}</strong></div>
+                                <div class="status-badge" :class="'status-' + file.processStatus.toLowerCase()">
+                                    {{ file.processStatus }}
+                                </div>
+                                <div style="font-size: 12px; color: #999; margin-top: 5px;">
+                                    {{ file.fileFormat }} | {{ formatFileSize(file.fileSize) }}
+                                </div>
+                            </div>
+                        </div>
+                    </el-tab-pane>
+
+                    <el-tab-pane label="知识库" name="knowledge">
+                        <el-button type="primary" @click="showCreateKB = true" style="margin-bottom: 15px;">
+                            创建知识库
+                        </el-button>
+                        
+                        <el-dialog v-model="showCreateKB" title="创建知识库">
+                            <el-form :model="newKB" label-width="80px">
+                                <el-form-item label="名称">
+                                    <el-input v-model="newKB.name" placeholder="请输入知识库名称"></el-input>
+                                </el-form-item>
+                                <el-form-item label="描述">
+                                    <el-input v-model="newKB.description" type="textarea" placeholder="请输入描述"></el-input>
+                                </el-form-item>
+                            </el-form>
+                            <template #footer>
+                                <el-button @click="showCreateKB = false">取消</el-button>
+                                <el-button type="primary" @click="createKnowledgeBase">创建</el-button>
+                            </template>
+                        </el-dialog>
+
+                        <el-select v-model="selectedKB" placeholder="选择知识库" style="width: 100%;" @change="loadFiles">
+                            <el-option v-for="kb in knowledgeBases" :key="kb.id" :label="kb.name" :value="kb.id"></el-option>
+                        </el-select>
+                    </el-tab-pane>
+                </el-tabs>
+            </div>
+
+            <!-- 右侧：智能对话 -->
+            <div class="chat-container">
+                <h2 style="margin-bottom: 15px;">💬 智能对话</h2>
+                
+                <div class="message-list" ref="messageList">
+                    <div v-if="messages.length === 0" style="text-align: center; color: #999; padding: 50px;">
+                        <h3>欢迎使用团队智能问答系统！</h3>
+                        <p>上传设计文档后，我可以基于知识库回答您的问题</p>
+                    </div>
+                    
+                    <div v-for="(msg, index) in messages" :key="index" 
+                         :class="['message', msg.role]">
+                        <div class="message-header">
+                            {{ msg.role === 'user' ? '👤 您' : '🤖 助手' }} | {{ msg.time }}
+                        </div>
+                        <div class="message-content">{{ msg.content }}</div>
+                        
+                        <!-- 知识来源 -->
+                        <div v-if="msg.sources && msg.sources.length > 0" class="knowledge-sources">
+                            <h4>📚 参考来源：</h4>
+                            <ul>
+                                <li v-for="(source, idx) in msg.sources" :key="idx">
+                                    {{ source.content.substring(0, 100) }}... (相关度: {{ (source.score * 100).toFixed(1) }}%)
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="input-area">
+                    <el-input
+                        v-model="userInput"
+                        type="textarea"
+                        :rows="3"
+                        placeholder="输入您的问题... (Shift+Enter换行，Enter发送)"
+                        @keydown="handleKeyDown"></el-input>
+                    <el-button type="primary" @click="sendMessage" :loading="loading" size="large">
+                        发送
+                    </el-button>
+                </div>
+
+                <div style="margin-top: 15px; display: flex; gap: 10px; align-items: center;">
+                    <el-select v-model="selectedKBForQuery" placeholder="选择查询的知识库" style="flex: 1;">
+                        <el-option v-for="kb in knowledgeBases" :key="kb.id" :label="kb.name" :value="kb.id"></el-option>
+                    </el-select>
+                    <el-button @click="clearChat">清空对话</el-button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const { createApp, ref, onMounted, nextTick, watch } = Vue;
+
+createApp({
+    setup() {
+        const activeTab = ref('upload');
+        const userInput = ref('');
+        const loading = ref(false);
+        const messages = ref([]);
+        const files = ref([]);
+        const knowledgeBases = ref([]);
+        const selectedKB = ref(null);
+        const selectedKBForQuery = ref(null);
+        const selectedUploadKB = ref(null); // 用于上传时选择知识库
+        const showCreateKB = ref(false);
+        const newKB = ref({ name: '', description: '' });
+        const messageList = ref(null);
+        const sessionId = ref('session-' + Date.now());
+
+        // 上传数据，包含知识库ID
+        const uploadData = ref({
+            knowledgeBaseId: selectedUploadKB
+        });
+        
+        const uploadHeaders = ref({});
+
+        // 更新上传数据中的知识库ID
+        const updateUploadData = () => {
+            uploadData.value.knowledgeBaseId = selectedUploadKB.value;
+        };
+
+        // 加载知识库列表
+        const loadKnowledgeBases = async () => {
+            try {
+                // 这里需要认证，暂时使用示例数据
+                knowledgeBases.value = [
+                    { id: 1, name: '设计规范库', description: '公司设计规范文档' },
+                    { id: 2, name: '项目文档', description: '项目相关文档' }
+                ];
+                if (knowledgeBases.value.length > 0) {
+                    selectedKB.value = knowledgeBases.value[0].id;
+                    selectedKBForQuery.value = knowledgeBases.value[0].id;
+                    selectedUploadKB.value = knowledgeBases.value[0].id; // 默认选择第一个知识库用于上传
+                    updateUploadData(); // 更新上传数据
+                }
+            } catch (error) {
+                console.error('加载知识库失败:', error);
+            }
+        };
+
+        // 加载文件列表
+        const loadFiles = async () => {
+            if (!selectedKB.value) return;
+            try {
+                // 示例数据
+                files.value = [
+                    { id: 1, fileName: '设计规范v2.0.pdf', fileFormat: 'PDF', fileSize: 2048000, processStatus: 'COMPLETED' },
+                    { id: 2, fileName: '色彩规范.md', fileFormat: 'MD', fileSize: 150000, processStatus: 'COMPLETED' }
+                ];
+            } catch (error) {
+                console.error('加载文件失败:', error);
+            }
+        };
+
+        // 上传成功
+        const handleUploadSuccess = (response) => {
+            ElementPlus.ElMessage.success('文件上传成功');
+            loadFiles();
+        };
+
+        // 上传失败
+        const handleUploadError = (error) => {
+            ElementPlus.ElMessage.error('文件上传失败: ' + error.message);
+        };
+
+        // 发送消息
+        const sendMessage = async () => {
+            if (!userInput.value.trim() || loading.value) return;
+
+            const question = userInput.value.trim();
+            userInput.value = '';
+
+            // 添加用户消息
+            messages.value.push({
+                role: 'user',
+                content: question,
+                time: new Date().toLocaleTimeString()
+            });
+
+            loading.value = true;
+
+            try {
+                // 调用RAG API
+                const response = await axios.post('/api/rag/query', {
+                    query: question,
+                    knowledgeBaseIds: selectedKBForQuery.value ? [selectedKBForQuery.value] : [],
+                    topK: 5
+                }, {
+                    headers: {
+                        'X-Session-Id': sessionId.value
+                    }
+                });
+
+                const result = response.data.data;
+
+                // 添加助手回复
+                messages.value.push({
+                    role: 'assistant',
+                    content: result.answer || '抱歉，我暂时无法回答这个问题。',
+                    time: new Date().toLocaleTimeString(),
+                    sources: result.results || []
+                });
+
+                await nextTick();
+                scrollToBottom();
+            } catch (error) {
+                ElementPlus.ElMessage.error('查询失败: ' + error.message);
+                messages.value.push({
+                    role: 'assistant',
+                    content: '抱歉，处理您的请求时出现了错误。请稍后再试。',
+                    time: new Date().toLocaleTimeString()
+                });
+            } finally {
+                loading.value = false;
+            }
+        };
+
+        // 处理键盘事件
+        const handleKeyDown = (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        };
+
+        // 创建知识库
+        const createKnowledgeBase = async () => {
+            if (!newKB.value.name) {
+                ElementPlus.ElMessage.warning('请输入知识库名称');
+                return;
+            }
+            try {
+                // 调用创建API
+                ElementPlus.ElMessage.success('知识库创建成功');
+                showCreateKB.value = false;
+                newKB.value = { name: '', description: '' };
+                loadKnowledgeBases();
+            } catch (error) {
+                ElementPlus.ElMessage.error('创建失败: ' + error.message);
+            }
+        };
+
+        // 清空对话
+        const clearChat = () => {
+            messages.value = [];
+            sessionId.value = 'session-' + Date.now();
+        };
+
+        // 滚动到底部
+        const scrollToBottom = () => {
+            if (messageList.value) {
+                messageList.value.scrollTop = messageList.value.scrollHeight;
+            }
+        };
+
+        // 格式化文件大小
+        const formatFileSize = (bytes) => {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        };
+
+        // 当选择上传知识库时更新上传数据
+        watch(selectedUploadKB, () => {
+            updateUploadData();
+        });
+
+        onMounted(() => {
+            loadKnowledgeBases();
+            loadFiles();
+        });
+
+        return {
+            activeTab,
+            userInput,
+            loading,
+            messages,
+            files,
+            knowledgeBases,
+            selectedKB,
+            selectedKBForQuery,
+            selectedUploadKB, // 添加这个返回值
+            showCreateKB,
+            newKB,
+            messageList,
+            uploadData,
+            uploadHeaders,
+            handleUploadSuccess,
+            handleUploadError,
+            sendMessage,
+            handleKeyDown,
+            createKnowledgeBase,
+            clearChat,
+            formatFileSize
+        };
+    }
+}).use(ElementPlus).mount('#app');
+</script>
+</body>
+</html>
