@@ -1,31 +1,23 @@
 package com.knowledgemanager.memory.service;
 
+import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.knowledgemanager.common.entity.UserMemory;
 import com.knowledgemanager.common.mapper.UserMemoryMapper;
-import com.knowledgemanager.common.util.IdGenerator;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 
 /**
  * 长期记忆服务
- * 主动录入 + 向量化存储 + 语义相似度召回
- * 用于存储用户的重要信息、偏好、历史交互等
+ * 向量化存储到 MySQL (JSON) + 余弦相似度语义召回
  */
 @Slf4j
 @Service
@@ -38,34 +30,35 @@ public class LongTermMemoryService {
     private EmbeddingModel embeddingModel;
 
     @Resource
-    private EmbeddingStore<TextSegment> embeddingStore;
+    private com.knowledgemanager.llm.service.LLMService llmService;
 
     /**
-     * 提取并存储记忆（从对话中自动提取重要信息）
+     * 从对话中提取重要信息并存储记忆
      */
     public void extractAndStoreMemories(Long userId, String query, String answer) {
-        // 这里可以调用LLM提取重要信息，简化版本直接存储
-        // 实际应该使用LLM判断哪些信息重要
-        
-        // 示例：存储用户的查询历史（可以过滤出重要的）
-        if (query.length() > 10) { // 简单过滤：太短的问题不存储
+        try {
+            // 使用LLM提取重要信息
+            String importantInfo = llmService.extractImportantInfo(query, answer);
+            if (importantInfo == null || importantInfo.trim().isEmpty()) {
+                return;
+            }
+
             UserMemory memory = new UserMemory();
             memory.setUserId(userId);
-            memory.setMemoryType("QUERY_HISTORY");
-            memory.setContent(String.format("用户询问: %s", query));
-            memory.setMetadata(String.format("{\"answer_preview\": \"%s\"}", 
-                answer.length() > 100 ? answer.substring(0, 100) + "..." : answer));
-            memory.setImportanceScore(calculateImportance(query));
+            memory.setMemoryType("IMPORTANT_INFO");
+            memory.setContent(importantInfo);
+            memory.setMetadata(JSON.toJSONString(java.util.Map.of(
+                "source_query", query,
+                "source_answer", answer.length() > 200 ? answer.substring(0, 200) + "..." : answer
+            )));
+            memory.setImportanceScore(calculateImportance(importantInfo));
             memory.setDeleted(0);
 
             userMemoryMapper.insert(memory);
-
-            // 向量化存储
-            try {
-                storeMemoryVector(memory);
-            } catch (Exception e) {
-                log.error("Failed to store memory vector: {}", e.getMessage(), e);
-            }
+            storeMemoryVector(memory);
+            log.info("Stored long-term memory: userId={}, memoryId={}", userId, memory.getId());
+        } catch (Exception e) {
+            log.error("Failed to extract and store memory: {}", e.getMessage(), e);
         }
     }
 
@@ -81,50 +74,60 @@ public class LongTermMemoryService {
         memory.setDeleted(0);
 
         userMemoryMapper.insert(memory);
-
         try {
             storeMemoryVector(memory);
-            log.info("Added long-term memory: userId={}, type={}", userId, type);
         } catch (Exception e) {
             log.error("Failed to store memory vector: {}", e.getMessage(), e);
         }
     }
 
     /**
-     * 检索记忆 - 基于语义相似度
+     * 语义相似度检索记忆
      */
     public List<String> retrieveMemories(Long userId, String query, int topK) {
         try {
-            // 将查询向量化
+            // 1. 向量化查询
             Embedding queryEmbedding = embeddingModel.embed(query).content();
+            List<Float> queryVector = queryEmbedding.vectorAsList();
 
-            // 搜索相似记忆
-            EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(queryEmbedding)
-                    .maxResults(topK * 2)
-                    .minScore(0.6)
-                    .build();
+            // 2. 拉取该用户所有记忆
+            List<UserMemory> allMemories = userMemoryMapper.selectList(
+                new LambdaQueryWrapper<UserMemory>()
+                    .eq(UserMemory::getUserId, userId)
+                    .eq(UserMemory::getDeleted, 0)
+                    .isNotNull(UserMemory::getEmbedding)
+            );
 
-            EmbeddingSearchResult<TextSegment> searchResult = embeddingStore.search(searchRequest);
-            List<EmbeddingMatch<TextSegment>> matches = searchResult.matches();
+            if (allMemories.isEmpty()) {
+                return new ArrayList<>();
+            }
 
-            // 过滤并排序
-            List<String> memories = new ArrayList<>();
-            for (EmbeddingMatch<TextSegment> match : matches) {
-                Metadata metadata = match.embedded().metadata();
-                Long memoryUserId = metadata.getLong("userId");
-                
-                if (memoryUserId != null && memoryUserId.equals(userId)) {
-                    memories.add(match.embedded().text());
-                }
-
-                if (memories.size() >= topK) {
-                    break;
+            // 3. 计算余弦相似度并排序
+            List<MemoryScore> scored = new ArrayList<>();
+            for (UserMemory memory : allMemories) {
+                try {
+                    List<Float> memoryVector = parseEmbedding(memory.getEmbedding());
+                    if (memoryVector == null || memoryVector.size() != queryVector.size()) {
+                        continue;
+                    }
+                    double similarity = cosineSimilarity(queryVector, memoryVector);
+                    if (similarity >= 0.6) {
+                        scored.add(new MemoryScore(memory.getContent(), similarity));
+                    }
+                } catch (Exception e) {
+                    log.warn("Failed to compute similarity for memoryId={}: {}", memory.getId(), e.getMessage());
                 }
             }
 
-            log.info("Retrieved {} long-term memories for userId={}", memories.size(), userId);
-            return memories;
+            scored.sort(Comparator.comparingDouble((MemoryScore s) -> s.score).reversed());
+
+            List<String> results = new ArrayList<>();
+            for (int i = 0; i < Math.min(topK, scored.size()); i++) {
+                results.add(scored.get(i).content);
+            }
+
+            log.info("Retrieved {} long-term memories for userId={}", results.size(), userId);
+            return results;
         } catch (Exception e) {
             log.error("Failed to retrieve memories: {}", e.getMessage(), e);
             return new ArrayList<>();
@@ -132,51 +135,59 @@ public class LongTermMemoryService {
     }
 
     /**
-     * 向量化存储单条记忆
+     * 向量化并存入 MySQL embedding 列
      */
     private void storeMemoryVector(UserMemory memory) {
-        HashMap<String, Object> metadataMap = new HashMap<>();
-        metadataMap.put("memoryId", memory.getId());
-        metadataMap.put("userId", memory.getUserId());
-        metadataMap.put("memoryType", memory.getMemoryType());
-        metadataMap.put("importance", memory.getImportanceScore());
-
-        Metadata docMetadata = new Metadata(metadataMap);
-        TextSegment segment = TextSegment.from(memory.getContent(), docMetadata);
-        Embedding embedding = embeddingModel.embed(segment).content();
-        
-        String vectorId = IdGenerator.generateVectorId();
-        embeddingStore.add(embedding, segment);
-
-        // 更新MySQL中的vectorId
-        memory.setVectorId(vectorId);
+        Response<Embedding> response = embeddingModel.embed(memory.getContent());
+        List<Float> vector = response.content().vectorAsList();
+        memory.setEmbedding(JSON.toJSONString(vector));
         userMemoryMapper.updateById(memory);
     }
 
     /**
-     * 计算重要性评分（简化版本）
+     * 计算余弦相似度
+     */
+    private double cosineSimilarity(List<Float> a, List<Float> b) {
+        double dotProduct = 0.0;
+        double normA = 0.0;
+        double normB = 0.0;
+        for (int i = 0; i < a.size(); i++) {
+            dotProduct += a.get(i) * b.get(i);
+            normA += a.get(i) * a.get(i);
+            normB += b.get(i) * b.get(i);
+        }
+        if (normA == 0 || normB == 0) {
+            return 0.0;
+        }
+        return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    /**
+     * 从 JSON 解析向量
+     */
+    private List<Float> parseEmbedding(String embeddingJson) {
+        if (embeddingJson == null || embeddingJson.isEmpty()) {
+            return null;
+        }
+        return JSON.parseArray(embeddingJson, Float.class);
+    }
+
+    /**
+     * 计算重要性评分
      */
     private double calculateImportance(String content) {
-        double score = 0.5; // 基础分
-
-        // 长度越长可能越重要
+        double score = 0.5;
         if (content.length() > 50) score += 0.1;
         if (content.length() > 100) score += 0.1;
-
-        // 包含关键词可能更重要
         String[] importantKeywords = {"设计", "规范", "标准", "要求", "必须", "重要"};
         for (String keyword : importantKeywords) {
             if (content.contains(keyword)) {
                 score += 0.1;
             }
         }
-
         return Math.min(score, 1.0);
     }
 
-    /**
-     * 获取用户的所有记忆
-     */
     public List<UserMemory> getUserMemories(Long userId) {
         return userMemoryMapper.selectList(
             new LambdaQueryWrapper<UserMemory>()
@@ -186,24 +197,22 @@ public class LongTermMemoryService {
         );
     }
 
-    /**
-     * 删除记忆
-     */
     public void deleteMemory(Long memoryId, Long userId) {
         UserMemory memory = userMemoryMapper.selectById(memoryId);
         if (memory != null && memory.getUserId().equals(userId)) {
             memory.setDeleted(1);
             userMemoryMapper.updateById(memory);
-
-            if (memory.getVectorId() != null) {
-                try {
-                    embeddingStore.remove(memory.getVectorId());
-                } catch (Exception e) {
-                    log.warn("Failed to remove memory vector: {}", e.getMessage());
-                }
-            }
-
             log.info("Deleted long-term memory: memoryId={}", memoryId);
+        }
+    }
+
+    private static class MemoryScore {
+        String content;
+        double score;
+
+        MemoryScore(String content, double score) {
+            this.content = content;
+            this.score = score;
         }
     }
 }

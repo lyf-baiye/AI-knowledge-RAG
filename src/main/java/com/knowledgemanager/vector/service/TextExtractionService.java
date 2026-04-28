@@ -11,7 +11,7 @@ import java.io.InputStream;
 
 /**
  * 文本提取服务
- * 使用 Apache Tika 支持 PDF, Word, Markdown, TXT 等几乎所有主流格式
+ * 直接使用 Apache Tika，支持 PDF/Word/Markdown/TXT 等所有主流格式
  */
 @Slf4j
 @Service

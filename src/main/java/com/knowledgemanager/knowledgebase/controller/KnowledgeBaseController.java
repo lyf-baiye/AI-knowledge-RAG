@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
 import javax.validation.Valid;
 
 @Slf4j
@@ -20,9 +21,12 @@ public class KnowledgeBaseController {
     @Resource
     private KnowledgeBaseService knowledgeBaseService;
 
-    // TODO: 添加JWT拦截器获取当前用户ID，这里暂时硬编码为1
+    @Resource
+    private HttpServletRequest request;
+
     private Long getCurrentUserId() {
-        return 1L;
+        Long userId = (Long) request.getAttribute("userId");
+        return userId != null ? userId : 1L;
     }
 
     @PostMapping

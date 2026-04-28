@@ -7,11 +7,8 @@ import lombok.Builder;
 
 import java.util.*;
 import java.util.function.Function;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static java.util.Arrays.asList;
-import static java.util.Collections.singletonList;
 
 public class BM25Encoder {
 
@@ -29,6 +26,7 @@ public class BM25Encoder {
     private Map<String, Map<String, Integer>> termFrequencyCache; // cache of term frequency
     private Map<String, Integer> documentLengthCache; // cache of document lengths
     private double averageDocumentLength;
+    private Map<String, Long> documentFrequency; // term -> number of documents containing it
     
     @Builder
     public BM25Encoder(Function<String, List<String>> tokenizer, Double k1, Double b) {
@@ -72,25 +70,88 @@ public class BM25Encoder {
         } else {
             averageDocumentLength = (double) totalDocumentLength / documentIds.size();
         }
-        
+
+        // Calculate document frequency for each unique term
+        documentFrequency = new HashMap<>();
+        for (Map<String, Integer> termFreq : termFrequencyInDocuments.values()) {
+            for (String term : termFreq.keySet()) {
+                documentFrequency.merge(term, 1L, Long::sum);
+            }
+        }
+
         // Calculate IDF for each unique term
         Set<String> uniqueTerms = new HashSet<>();
         for (Map<String, Integer> termFreq : termFrequencyInDocuments.values()) {
             uniqueTerms.addAll(termFreq.keySet());
         }
-        
+
         idfCache = new HashMap<>();
         for (String term : uniqueTerms) {
-            long documentsContainingTerm = termFrequencyInDocuments.values().stream()
-                    .mapToLong(termFreq -> termFreq.getOrDefault(term, 0))
-                    .filter(freq -> freq > 0)
-                    .count();
-            
-            double idf = Math.log(1.0 + (documentIds.size() - documentsContainingTerm + 0.5) / (documentsContainingTerm + 0.5));
+            long docCount = documentFrequency.getOrDefault(term, 0L);
+            double idf = Math.log(1.0 + (documentIds.size() - docCount + 0.5) / (docCount + 0.5));
             Map<String, Double> termIdf = new HashMap<>();
             termIdf.put(term, idf);
             idfCache.put(term, termIdf);
         }
+    }
+
+    /**
+     * 增量训练：仅处理新文档，更新TF、文档频率和IDF
+     * 时间复杂度 O(newTerms × 1) 而非 O(allTerms × allDocs)
+     */
+    public void updateTrain(List<TextSegment> newDocuments) {
+        if (newDocuments == null || newDocuments.isEmpty()) {
+            return;
+        }
+        if (documentIds == null) {
+            // 未训练过，走完整训练流程
+            train(newDocuments);
+            return;
+        }
+
+        int startIdx = documentIds.size();
+        Set<String> affectedTerms = new HashSet<>();
+
+        for (int i = 0; i < newDocuments.size(); i++) {
+            TextSegment doc = newDocuments.get(i);
+            String docId = "doc_" + (startIdx + i);
+            documentIds.add(docId);
+
+            List<String> tokens = tokenizer.apply(doc.text());
+            Map<String, Integer> tf = new HashMap<>();
+            for (String token : tokens) {
+                tf.merge(token, 1, Integer::sum);
+            }
+            termFrequencyCache.put(docId, tf);
+
+            int docLen = tokens.size();
+            documentLengthCache.put(docId, docLen);
+
+            // 更新文档频率：只对新文档中的术语增加计数
+            for (String term : tf.keySet()) {
+                documentFrequency.merge(term, 1L, Long::sum);
+                affectedTerms.add(term);
+            }
+        }
+
+        // 更新平均文档长度
+        int totalOldLength = 0;
+        for (int len : documentLengthCache.values()) {
+            totalOldLength += len;
+        }
+        averageDocumentLength = (double) totalOldLength / documentIds.size();
+
+        // 重新计算受影响术语和新术语的IDF
+        int totalDocs = documentIds.size();
+        for (String term : affectedTerms) {
+            long docCount = documentFrequency.getOrDefault(term, 0L);
+            double idf = Math.log(1.0 + (totalDocs - docCount + 0.5) / (docCount + 0.5));
+            Map<String, Double> termIdf = new HashMap<>();
+            termIdf.put(term, idf);
+            idfCache.put(term, termIdf);
+        }
+
+        // 新术语也已通过affectedTerms覆盖（它们在循环中已经添加到documentFrequency）
     }
     
     public Embedding embed(TextSegment textSegment) {

@@ -36,6 +36,12 @@ public class UserMemory implements Serializable {
     private String vectorId;
 
     /**
+     * 向量数据（JSON数组），用于本地余弦相似度计算
+     */
+    @TableField("embedding")
+    private String embedding;
+
+    /**
      * 元数据（JSON格式）
      */
     private String metadata;

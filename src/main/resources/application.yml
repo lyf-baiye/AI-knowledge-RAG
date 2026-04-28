@@ -77,6 +77,7 @@ rag:
   retrieval-top-k: 5
   score-threshold: 0.7
   max-context-length: 4000
+  conversation-rounds: 5  # LLM Prompt中携带的对话历史轮次（每轮=用户+AI各一条）
 
 # 重排序配置
 rerank:

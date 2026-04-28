@@ -6,18 +6,16 @@ import com.alibaba.dashscope.embeddings.TextEmbeddingResult;
 import com.alibaba.dashscope.embeddings.TextEmbeddingResultItem;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
-import com.alibaba.fastjson2.TypeReference;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.knowledgemanager.common.entity.Chunk;
 import com.knowledgemanager.common.entity.ProcessingRule;
 import com.knowledgemanager.common.mapper.ChunkMapper;
-import com.knowledgemanager.common.util.IdGenerator;
-import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.bm25.BM25Encoder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
@@ -26,7 +24,6 @@ import org.springframework.web.multipart.MultipartFile;
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -69,8 +66,11 @@ public class HybridVectorService {
 
     @PostConstruct
     public void init() {
-        this.restTemplate = new RestTemplate();
-        this.bm25Encoder = null; // 初始化为null，等待首次训练
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(5000);
+        factory.setReadTimeout(30000);
+        this.restTemplate = new RestTemplate(factory);
+        this.bm25Encoder = null;
         log.info("HybridVectorService initialized via REST API.");
     }
 
@@ -88,27 +88,29 @@ public class HybridVectorService {
             }
             log.info("Extracted {} characters", text.length());
 
-            // 2. 智能分片
+            // 2. 语义相似度分片
             int chunkSize = rule != null && rule.getChunkSize() != null ? rule.getChunkSize() : 500;
-            int overlap = rule != null && rule.getChunkOverlap() != null ? rule.getChunkOverlap() : 50;
-            String strategy = rule != null && rule.getChunkingStrategy() != null ? rule.getChunkingStrategy() : "SEMANTIC";
+            double similarityThreshold = 0.7;
 
-            List<TextSegment> segments = textChunkService.chunk(text, fileId, knowledgeBaseId, chunkSize, overlap, strategy);
+            List<TextSegment> segments = textChunkService.chunk(text, fileId, knowledgeBaseId, chunkSize, similarityThreshold);
             log.info("Chunked into {} segments", segments.size());
 
-            // 3. 获取知识库中所有分片，用于训练BM25编码器
-            List<TextSegment> allSegments = getAllSegmentsForKnowledgeBase(knowledgeBaseId, fileId);
-            allSegments.addAll(segments); // 添加当前正在处理的新分片
-
-            // 4. 使用全部分片训练BM25Encoder
-            log.info("Training BM25Encoder with all {} segments in knowledge base", allSegments.size());
-            BM25Encoder newBm25Encoder = BM25Encoder.builder()
-                    .tokenizer(textStr -> Arrays.asList(textStr.split("\\s+"))) // 更改参数名称以避免冲突
-                    .build();
-            newBm25Encoder.train(allSegments);
-            
-            // 更新全局编码器
-            this.bm25Encoder = newBm25Encoder;
+            // 3. 训练或增量更新BM25Encoder
+            if (this.bm25Encoder == null) {
+                // 首次上传：全量训练
+                List<TextSegment> allSegments = getAllSegmentsForKnowledgeBase(knowledgeBaseId, fileId);
+                allSegments.addAll(segments);
+                log.info("Initial BM25 training with all {} segments", allSegments.size());
+                BM25Encoder newEncoder = BM25Encoder.builder()
+                        .tokenizer(textStr -> tokenize(textStr))
+                        .build();
+                newEncoder.train(allSegments);
+                this.bm25Encoder = newEncoder;
+            } else {
+                // 后续上传：增量更新（仅处理新分片，O(newTerms) 而非 O(allTerms × allDocs)）
+                log.info("Incremental BM25 update with {} new segments", segments.size());
+                this.bm25Encoder.updateTrain(segments);
+            }
 
             List<Chunk> chunkEntities = new ArrayList<>();
 
@@ -233,15 +235,41 @@ public class HybridVectorService {
     @Transactional
     public void deleteByFileId(Long fileId) {
         try {
-            // 1. 从 MySQL 删除
+            // 1. 查询该文件的所有分块ID（用于拼装Pinecone向量ID）
+            List<Chunk> chunks = chunkMapper.selectList(
+                new LambdaQueryWrapper<Chunk>().eq(Chunk::getFileId, fileId)
+            );
+
+            // 2. 从 Pinecone 批量删除向量
+            if (!chunks.isEmpty()) {
+                List<String> vectorIds = chunks.stream()
+                    .map(chunk -> "chunk_" + chunk.getId())
+                    .collect(Collectors.toList());
+
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                headers.set("Api-Key", pineconeApiKey);
+
+                JSONObject body = new JSONObject();
+                body.put("ids", vectorIds);
+                body.put("namespace", "default");
+
+                HttpEntity<String> entity = new HttpEntity<>(body.toJSONString(), headers);
+                String url = indexUrl + "/vectors/delete";
+                ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+
+                if (response.getStatusCode().is2xxSuccessful()) {
+                    log.info("Deleted {} vectors from Pinecone for fileId={}", vectorIds.size(), fileId);
+                } else {
+                    log.warn("Pinecone delete returned non-200 for fileId={}: {}", fileId, response.getBody());
+                }
+            }
+
+            // 3. 从 MySQL 删除 chunk 记录
             chunkMapper.delete(new LambdaQueryWrapper<Chunk>().eq(Chunk::getFileId, fileId));
 
-            // 2. 从 Pinecone 删除 (通过 Metadata 过滤)
-            // 注意：当前 Pinecone REST API 不直接支持通过 metadata 删除，需要先查询 IDs 再删除
-            // 暂时只做 MySQL 删除，Pinecone 中的向量可能需要定期清理
-            
         } catch (Exception e) {
-            log.error("Failed to delete file data for {}: {}", fileId, e.getMessage(), e);
+            log.error("Failed to delete file data for fileId={}: {}", fileId, e.getMessage(), e);
         }
     }
 
@@ -332,5 +360,70 @@ public class HybridVectorService {
             log.error("Hybrid search failed: {}", e.getMessage(), e);
             return new ArrayList<>();
         }
+    }
+
+    /**
+     * 中英文混合分词器
+     * 中文：字符级 bigram + unigram
+     * 英文：按空白和标点切分单词
+     */
+    private List<String> tokenize(String text) {
+        List<String> tokens = new ArrayList<>();
+        if (text == null || text.isEmpty()) {
+            return tokens;
+        }
+
+        StringBuilder chineseBuffer = new StringBuilder();
+        StringBuilder englishBuffer = new StringBuilder();
+
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (isChinese(c)) {
+                if (englishBuffer.length() > 0) {
+                    tokens.add(englishBuffer.toString().toLowerCase());
+                    englishBuffer.setLength(0);
+                }
+                chineseBuffer.append(c);
+            } else if (Character.isLetterOrDigit(c)) {
+                if (chineseBuffer.length() > 0) {
+                    addChineseTokens(tokens, chineseBuffer.toString());
+                    chineseBuffer.setLength(0);
+                }
+                englishBuffer.append(c);
+            } else {
+                if (chineseBuffer.length() > 0) {
+                    addChineseTokens(tokens, chineseBuffer.toString());
+                    chineseBuffer.setLength(0);
+                }
+                if (englishBuffer.length() > 0) {
+                    tokens.add(englishBuffer.toString().toLowerCase());
+                    englishBuffer.setLength(0);
+                }
+            }
+        }
+
+        if (chineseBuffer.length() > 0) {
+            addChineseTokens(tokens, chineseBuffer.toString());
+        }
+        if (englishBuffer.length() > 0) {
+            tokens.add(englishBuffer.toString().toLowerCase());
+        }
+
+        return tokens;
+    }
+
+    private void addChineseTokens(List<String> tokens, String chineseText) {
+        // unigram: 每个字单独作为一个 token
+        for (int i = 0; i < chineseText.length(); i++) {
+            tokens.add(String.valueOf(chineseText.charAt(i)));
+        }
+        // bigram: 相邻两个字组成一个 token
+        for (int i = 0; i < chineseText.length() - 1; i++) {
+            tokens.add(chineseText.substring(i, i + 2));
+        }
+    }
+
+    private boolean isChinese(char c) {
+        return Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN;
     }
 }

@@ -8,8 +8,6 @@ import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.output.Response;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -53,26 +51,26 @@ public class VectorConfig {
                             .model("text-embedding-v3")
                             .text(textSegment.text())
                             .build();
-                    
+
                     TextEmbedding textEmbedding = new TextEmbedding();
                     TextEmbeddingResult result = textEmbedding.call(param);
-                    
-                    if (result != null && result.getOutput() != null && 
-                        result.getOutput().getEmbeddings() != null && 
+
+                    if (result != null && result.getOutput() != null &&
+                        result.getOutput().getEmbeddings() != null &&
                         !result.getOutput().getEmbeddings().isEmpty()) {
-                        
-                        TextEmbeddingResultItem item = 
+
+                        TextEmbeddingResultItem item =
                             result.getOutput().getEmbeddings().get(0);
-                        
+
                         List<Float> vector = item.getEmbedding().stream()
                             .map(Double::floatValue)
                             .collect(Collectors.toList());
-                        
+
                         Embedding embedding = Embedding.from(vector);
-                        
+
                         return Response.from(embedding);
                     }
-                    
+
                     throw new RuntimeException("Failed to generate embedding");
                 } catch (Exception e) {
                     throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
@@ -87,21 +85,12 @@ public class VectorConfig {
                         .map(this::embed)
                         .map(Response::content)
                         .collect(Collectors.toList());
-                    
+
                     return Response.from(embeddings);
                 } catch (Exception e) {
                     throw new RuntimeException("Failed to generate embeddings: " + e.getMessage(), e);
                 }
             }
         };
-    }
-
-    /**
-     * 配置EmbeddingStore Bean
-     * 用于长期记忆服务中的向量存储
-     */
-    @Bean
-    public EmbeddingStore<TextSegment> embeddingStore() {
-        return new InMemoryEmbeddingStore<>();
     }
 }

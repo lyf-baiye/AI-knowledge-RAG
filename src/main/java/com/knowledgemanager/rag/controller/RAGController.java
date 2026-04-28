@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
 import javax.validation.Valid;
 import java.util.List;
 
@@ -19,9 +20,12 @@ public class RAGController {
     @Resource
     private RAGService ragService;
 
-    // TODO: 从JWT中获取userId和sessionId
+    @Resource
+    private HttpServletRequest request;
+
     private Long getCurrentUserId() {
-        return 1L;
+        Long userId = (Long) request.getAttribute("userId");
+        return userId != null ? userId : 1L;
     }
 
     private String getSessionId(String headerSessionId) {

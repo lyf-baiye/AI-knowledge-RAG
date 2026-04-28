@@ -6,6 +6,7 @@ import com.knowledgemanager.common.util.IdGenerator;
 import com.knowledgemanager.memory.service.ShortTermMemoryService;
 import com.knowledgemanager.memory.service.LongTermMemoryService;
 import com.knowledgemanager.vector.service.HybridVectorService;
+import com.knowledgemanager.vector.service.RerankService;
 import com.knowledgemanager.llm.service.LLMService;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -41,6 +42,9 @@ public class RAGService {
     @Resource
     private LLMService llmService;
 
+    @Resource
+    private RerankService rerankService;
+
     @Value("${rag.system-prompt:你是一个专业的设计团队知识库助手。请基于以下检索到的设计知识内容来回答用户的问题。如果无法从提供的内容中找到答案，请说明你不知道，并建议用户查阅相关文档。}")
     private String systemPrompt;
 
@@ -49,6 +53,9 @@ public class RAGService {
 
     @Value("${rag.score-threshold:0.7}")
     private double scoreThreshold;
+
+    @Value("${rag.conversation-rounds:5}")
+    private int conversationRounds;
 
     /**
      * 完整的RAG查询流程：
@@ -79,8 +86,9 @@ public class RAGService {
             List<String> longTermMemories = longTermMemoryService.retrieveMemories(userId, rewrittenQuery, 3);
             log.info("Retrieved {} long-term memories", longTermMemories.size());
 
-            // 4. 构建Prompt并调用LLM
-            String answer = generateAnswer(rewrittenQuery, knowledgeChunks, longTermMemories, sessionId);
+            // 4. 构建Prompt并调用LLM（对话历史按轮次召回，每轮 = user消息 + assistant消息）
+            List<ShortTermMemoryService.MemoryMessage> shortTermMemory = shortTermMemoryService.getRecentMessages(userId, sessionId, conversationRounds * 2);
+            String answer = generateAnswer(queryDTO.getQuery(), knowledgeChunks, longTermMemories, shortTermMemory);
 
             long responseTime = System.currentTimeMillis() - startTime;
 
@@ -152,29 +160,24 @@ public class RAGService {
      * 检索知识 - Pinecone 原生混合检索 (Dense + Sparse)
      */
     private List<RAGResultDTO.ChunkResultDTO> retrieveKnowledge(String query, List<Long> knowledgeBaseIds) {
-        // 1. 调用原生混合检索服务 (Pinecone 内部自动融合 Dense 和 Sparse)
         List<Map<String, Object>> rawResults = hybridVectorService.hybridSearch(query, retrievalTopK * 2);
 
-        // 2. 将 Map 结果转换为 DTO
         List<RAGResultDTO.ChunkResultDTO> knowledgeChunks = new ArrayList<>();
         for (Map<String, Object> raw : rawResults) {
             RAGResultDTO.ChunkResultDTO dto = new RAGResultDTO.ChunkResultDTO();
-            
-            // 设置 ID
             dto.setChunkId(Long.valueOf(raw.get("id").toString()));
-            
-            // 设置分数
             dto.setScore(((Float) raw.get("score")).doubleValue());
-            
-            // 从 metadata 中获取内容和文件名 (因为我们在 upsert 时存进去了)
+            @SuppressWarnings("unchecked")
             Map<String, String> metadata = (Map<String, String>) raw.get("metadata");
             if (metadata != null) {
                 dto.setContent(metadata.get("content"));
                 dto.setFileName(metadata.get("fileName"));
             }
-            
             knowledgeChunks.add(dto);
         }
+
+        // 重排序
+        knowledgeChunks = rerankService.rerank(query, knowledgeChunks, retrievalTopK);
 
         return knowledgeChunks;
     }
@@ -182,12 +185,13 @@ public class RAGService {
     /**
      * 生成回答 - 基于检索到的知识和记忆
      */
-    private String generateAnswer(String query, List<RAGResultDTO.ChunkResultDTO> knowledgeChunks, 
-                                   List<String> longTermMemories, String sessionId) {
-        // 构建系统提示
+    private String generateAnswer(String originalQuery,
+                                   List<RAGResultDTO.ChunkResultDTO> knowledgeChunks,
+                                   List<String> longTermMemories,
+                                   List<ShortTermMemoryService.MemoryMessage> shortTermMemory) {
+        // 1. 构建系统提示：基础提示 + RAG知识 + 长期记忆
         StringBuilder systemPromptBuilder = new StringBuilder(systemPrompt);
 
-        // 添加知识上下文
         if (!knowledgeChunks.isEmpty()) {
             systemPromptBuilder.append("\n\n检索到的相关知识：\n");
             for (int i = 0; i < knowledgeChunks.size(); i++) {
@@ -196,7 +200,6 @@ public class RAGService {
             }
         }
 
-        // 添加长期记忆
         if (!longTermMemories.isEmpty()) {
             systemPromptBuilder.append("\n\n用户相关历史记忆：\n");
             for (int i = 0; i < longTermMemories.size(); i++) {
@@ -204,16 +207,29 @@ public class RAGService {
             }
         }
 
-        systemPromptBuilder.append("\n请基于以上内容回答用户的问题，确保回答准确、专业且相关。");
+        systemPromptBuilder.append("\n请基于以上内容和对话历史回答用户的问题，确保回答准确、专业且相关。");
 
-        // 调用LLM
+        // 2. 构建消息列表：SystemMessage + 对话历史 + 当前用户问题
+        List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
+
+        // SystemMessage: 系统提示 + RAG知识 + 长期记忆
+        messages.add(new SystemMessage(systemPromptBuilder.toString()));
+
+        // 对话历史（短期记忆）：不含最新一条用户消息，因为它就是当前问题
+        for (ShortTermMemoryService.MemoryMessage msg : shortTermMemory) {
+            if ("user".equals(msg.getRole())) {
+                messages.add(new UserMessage(msg.getContent()));
+            } else if ("assistant".equals(msg.getRole())) {
+                messages.add(new AiMessage(msg.getContent()));
+            }
+        }
+
+        // 当前用户问题（用原始问题，保留对话上下文中的指代关系）
+        messages.add(new UserMessage(originalQuery));
+
+        // 3. 调用LLM
         try {
-            Response<AiMessage> response = chatLanguageModel.generate(
-                List.of(
-                    new SystemMessage(systemPromptBuilder.toString()),
-                    new UserMessage(query)
-                )
-            );
+            Response<AiMessage> response = chatLanguageModel.generate(messages);
             return response.content().text();
         } catch (Exception e) {
             log.error("LLM generation failed: {}", e.getMessage(), e);
